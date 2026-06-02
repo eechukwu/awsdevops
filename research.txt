@@ -1,41 +1,30 @@
-# ─────────────────────────────────────────────────────────────
-# 1. THE SOURCES — what repos Flux pulls from, and the bootstrap anchor
-# ─────────────────────────────────────────────────────────────
-flux get sources git -A
-kubectl get gitrepositories -A \
-  -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,URL:.spec.url,REF:.spec.ref.branch
-# How Flux was bootstrapped (the root's path = the anchor of the whole tree):
-kubectl get kustomization flux-system -n flux-system \
-  -o jsonpath='{"root path:   "}{.spec.path}{"\nroot source: "}{.spec.sourceRef.kind}/{.spec.sourceRef.name}{"\n"}'
+Based on your confirmed architecture, the single object that owns all 32 children is the `infrastructure` Kustomization in `flux-system`. So the command was almost certainly one of these (all three do the same thing):
 
-# ─────────────────────────────────────────────────────────────
-# 2. THE KUSTOMIZATIONS — the full tree: name, what folder, which source, deps, prune
-# ─────────────────────────────────────────────────────────────
-kubectl get kustomizations -A \
-  -o custom-columns='NAME:.metadata.name,PATH:.spec.path,SOURCE:.spec.sourceRef.name,DEPENDSON:.spec.dependsOn[*].name,PRUNE:.spec.prune,READY:.status.conditions[?(@.type=="Ready")].status'
+```bash
+kubectl delete kustomization infrastructure -n flux-system
+# or the flux CLI equivalent (defaults to the flux-system namespace):
+flux delete kustomization infrastructure
+# or if he deleted it from a manifest file:
+kubectl delete -f <some-path>/infrastructure.yaml
+```
 
-# ─────────────────────────────────────────────────────────────
-# 3. THE ADDONS THEMSELVES — every HelmRelease and which namespace it lives in
-# ─────────────────────────────────────────────────────────────
-flux get helmreleases -A
-kubectl get helmreleases -A \
-  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,CHART:.spec.chart.spec.chart,VERSION:.spec.chart.spec.version'
+Any of those → `infrastructure`'s finalizer fires → prunes all 32 children → every addon gone → and since `infrastructure` is an unowned apex, nothing brings it back.
 
-# ─────────────────────────────────────────────────────────────
-# 4. THE DANGEROUS ROW — find which Kustomization OWNS the addons, then list its inventory
-#    (replace <NAME> with the addons/aggregator Kustomization from step 2 —
-#     the one whose PATH points at clusters/<env> or the components list)
-# ─────────────────────────────────────────────────────────────
-kubectl get kustomization <NAME> -n flux-system \
-  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' | sort
-# ^ if you see all 8 components (kyverno, keda, strimzi, ...) in ONE inventory,
-#   that's the single object whose deletion took everything.
+> Note the exact name: the children carry prefixes (`apps.fbg.…`, `apps.fmx-msk.…`), but the apex was just plain `infrastructure`. So the lethal command is literally `delete kustomization infrastructure`. The scary part is how *innocuous* it looks — it reads like deleting "one thing."
 
-# ─────────────────────────────────────────────────────────────
-# 5. IS THE WIRING SELF-HEALING? — does any Kustomization OWN the others,
-#    or are they apex objects planted by bootstrap?
-# ─────────────────────────────────────────────────────────────
-# For each Kustomization, see if it appears in another's inventory.
-# Quick proxy: does the root (flux-system) inventory contain other Kustomizations?
-kubectl get kustomization flux-system -n flux-system \
-  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' | grep -i kustomization
+## How to confirm *which* command he actually ran
+
+The cluster recorded it — two places to look:
+
+```bash
+# 1. Flux's own controller log — it logs the prune cascade it performed:
+kubectl logs -n flux-system deploy/kustomize-controller | grep -iE 'infrastructure|prune|delet|garbage'
+
+# 2. Kubernetes audit log (if enabled on the API server / EKS CloudTrail) —
+#    this names the USER, the verb, and the timestamp:
+#    look for: verb=delete  resource=kustomizations  name=infrastructure
+```
+
+On EKS specifically, that delete shows up in **CloudTrail** as an EKS audit event — `verb: delete`, `objectRef.resource: kustomizations`, `objectRef.name: infrastructure`, plus the IAM identity and exact time. That's your forensic proof of who ran it and when.
+
+Want to **reproduce it safely in your lab** so you can watch the exact cascade — but on the *self-healing* version, where you delete a child and it comes back (proving your lab doesn't have the apex flaw the office did)?
