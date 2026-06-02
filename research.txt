@@ -1,67 +1,104 @@
-Here's a tighter read-only set built specifically to make the **apex-vs-owned** distinction visible. The trick: Flux stamps every object it manages with a label naming its owner — so you can literally ask each Kustomization "who created you?"
-
-```bash
-# ─────────────────────────────────────────────────────────────
-# A. THE OWNERSHIP TABLE — each Kustomization and WHO OWNS IT
-#    (the label kustomize.toolkit.fluxcd.io/name = the parent that applied it)
-# ─────────────────────────────────────────────────────────────
-kubectl get kustomizations -n flux-system \
-  -o custom-columns='NAME:.metadata.name,OWNED-BY:.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name'
-```
-**What you'll see:** the 32 children show `OWNED-BY: infrastructure`. But `infrastructure` itself and the root `flux-system` show **`<none>`** — that blank is the signature of an **apex object** (nobody applied it via Flux → nobody will recreate it).
-
-```bash
-# ─────────────────────────────────────────────────────────────
-# B. LIST EVERY APEX OBJECT — the Kustomizations with NO owner
-#    (these are the ONLY ones that won't self-heal if deleted)
-# ─────────────────────────────────────────────────────────────
-kubectl get kustomizations -n flux-system -o json \
-  | jq -r '.items[] | select(.metadata.labels["kustomize.toolkit.fluxcd.io/name"] == null) | .metadata.name'
-# no jq? use this instead:
-kubectl get kustomizations -n flux-system \
-  -o custom-columns='NAME:.metadata.name,OWNER:.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name' \
-  | grep '<none>'
-```
-**What you'll see:** `flux-system` and `infrastructure`. Those are your two single-points-of-failure. Everything else self-heals; these two don't.
-
-```bash
-# ─────────────────────────────────────────────────────────────
-# C. THE SMOKING GUN — prove the root does NOT own infrastructure
-# ─────────────────────────────────────────────────────────────
-kubectl get kustomization flux-system -n flux-system \
-  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' \
-  | grep -i infrastructure \
-  && echo ">>> root OWNS infrastructure (would self-heal)" \
-  || echo ">>> root does NOT own infrastructure — it is an unowned APEX (will not self-heal)"
-```
-
-```bash
-# ─────────────────────────────────────────────────────────────
-# D. PROVE infrastructure owns the 32 children — count them
-# ─────────────────────────────────────────────────────────────
-kubectl get kustomization infrastructure -n flux-system \
-  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' \
-  | grep -ci 'Kustomization'
-# → expect ~32. That's the blast radius of one delete.
-```
-
-```bash
-# ─────────────────────────────────────────────────────────────
-# E. THE PATHS SIDE BY SIDE — why infrastructure is unowned
-#    (its path is OUTSIDE the folder the root renders)
-# ─────────────────────────────────────────────────────────────
-echo "root renders:           $(kubectl get kustomization flux-system   -n flux-system -o jsonpath='{.spec.path}')"
-echo "infrastructure renders: $(kubectl get kustomization infrastructure -n flux-system -o jsonpath='{.spec.path}')"
-```
-**What you'll see:** the root renders `clusters/fanatics-exchange/dev-1`. If `infrastructure`'s manifest does **not** live inside that folder, the root never applies it → it's the orphan-apex. That single fact is the root cause of "didn't come back."
+Here's both — a deployment summary for you, and a ready-to-paste prompt for your office Claude.
 
 ---
 
-**The story these five tell, in order:**
-- **A** = the whole ownership tree at a glance (who heals whom).
-- **B** = the exact list of objects that *can't* heal — your danger list.
-- **C** = proves `infrastructure` isn't under the root.
-- **D** = proves deleting it takes 32 things down.
-- **E** = explains *why* it's unowned (its manifest lives outside the root's path).
+## Part 1 — How we deployed the home lab (summary)
 
-Paste back **A** and **E** especially — those two together show the entire flaw on one screen.
+**`lab-hardway` — a bare-metal, 3-node GitOps platform, built as a portable bank-grade base template.**
+
+**Two-repo split**
+- `platform-k8s-infrastructure` — everything below the workload tier (storage, certs, policy, ingress, observability, Kafka, Flux itself).
+- `platform-k8s-apps` — the workloads (Online Boutique tenant).
+
+**Bootstrap (one command + one out-of-band secret)**
+1. Seed the `sops-age` Secret by hand (Flux needs it to decrypt the very first reconcile — chicken-and-egg).
+2. `flux bootstrap github --path=clusters/lab-hardway --token-auth` (classic PAT). This installs the 4 controllers, commits their manifests back, and plants the `flux-system` GitRepository + root Kustomization.
+
+**The wiring — Pattern X (the key bit vs the office)**
+- The **root `flux-system` Kustomization** renders `clusters/lab-hardway/`, whose `kustomization.yaml` lists exactly **three** things: `flux-system/`, `infrastructure.yaml`, `apps.yaml`.
+- `infrastructure.yaml` is a **file** (not an object) declaring **16 Flux Kustomizations**, one per component.
+- Because the root renders that file, **the root directly owns all 16** — they all self-heal, and there is **no intermediate `infrastructure` apex object** to delete.
+- `components/` holds only cluster-agnostic workload CRs; cluster-specifics live in `clusters/<name>/` + a `cluster-vars` ConfigMap injected via `postBuild.substituteFrom`. → portable to any cluster by copying one folder.
+
+**The dependency cascade (Tier model, ordered by `dependsOn`)**
+- Tier 0: `local-path-provisioner` (storage)
+- Tier 1: controllers/operators — `cert-manager`, `kyverno`, `metallb`, `envoy-gateway`, `reloader`, `datadog-operator`, `strimzi-cluster-operator` + `config` + `secrets`
+- Tier 1 CR-pairs (CRD-then-CR): `cert-manager-issuers`, `kyverno-policies`, `metallb-config`
+- Tier 2 operator-CRs: `datadog-agent`, `kafka-clusters`, `platform-gateway` (these use `wait: false` + explicit `healthChecks`, because the operator spawns the real pods out-of-band)
+- Tier 3: `apps` → boutique
+
+**Ingress path:** MetalLB (L2, pool `192.168.8.16-31`) → Envoy Gateway (Gateway API, replacing EOL ingress-nginx) → `platform-gateway` (TLS from cert-manager internal CA) → boutique `HTTPRoute`.
+
+**The two acceptance goals (both proven this session):**
+1. **One-click install AND delete** — `flux-bootstrap.sh` cold-boots to all-Ready in ~3 min; `flux-cleanup.sh` tears down to a pristine "Layer 0" and asserts it.
+2. **Portability** — `components/` stay cluster-agnostic; a new cluster = copy `clusters/<name>/` + edit `cluster-vars`.
+
+**Resilience property (the contrast with the office incident):** every component is owned by the self-managing root, so deleting any one leaf self-heals. The only irreducible apex is the bootstrap root itself.
+
+---
+
+## Part 2 — Prompt to paste into your office Claude
+
+```
+You are looking at our office Flux cluster (context: the fanatics-exchange / dev-1
+EKS cluster, repos fbg-sportsbook-infrastructure-cicd + fbg-sportsbook-cicd).
+
+I've been studying a separate home-lab GitOps platform ("lab-hardway") and I want
+you to compare our office setup against it, focused on RESILIENCE and BLAST RADIUS.
+Here is how the home lab is wired:
+
+— Two repos: platform-infra + apps.
+— Bootstrap: `flux bootstrap … --path=clusters/lab-hardway`. The ROOT `flux-system`
+  Kustomization renders clusters/lab-hardway/, whose kustomization.yaml lists exactly
+  three things: flux-system/, infrastructure.yaml, apps.yaml.
+— infrastructure.yaml is a FILE declaring 16 separate Flux Kustomizations (one per
+  component: cert-manager, kyverno, metallb, envoy-gateway, reloader, datadog-operator,
+  strimzi, plus CRD-then-CR pairs and operator-CRs).
+— CRITICAL: because the root renders that file, the root DIRECTLY OWNS all 16
+  component Kustomizations. There is NO intermediate "infrastructure" Kustomization
+  object. Running `kubectl get kustomizations -o custom-columns=NAME,OWNED-BY:
+  .metadata.labels.kustomize\.toolkit\.fluxcd\.io/name` shows EVERY component
+  OWNED-BY: flux-system. The only unowned apex is the bootstrap root itself.
+— Consequence: deleting any single component Kustomization self-heals (the root
+  recreates it). There is no single object whose deletion takes down all addons
+  without recovery.
+— Components are cluster-agnostic; cluster specifics come from a cluster-vars ConfigMap
+  via postBuild.substituteFrom. dependsOn encodes boot order. Operator-CR Kustomizations
+  use wait:false + healthChecks. prune:true throughout. One-click teardown script
+  asserts a pristine baseline.
+
+CONTEXT — why I care: someone once deleted our office `infrastructure` Kustomization
+and ALL addons disappeared and did NOT come back. We established that our office
+`infrastructure` Kustomization owns ~32 child Kustomizations and is itself an UNOWNED
+APEX (not owned by the root, because its manifest lives outside the root's rendered
+path), so nothing recreated it.
+
+YOUR TASK — inspect the office cluster (READ-ONLY only: kubectl get / describe /
+jsonpath / flux get / flux tree; NO delete/apply/patch) and produce a structured
+comparison against the home-lab pattern above. Specifically:
+
+1. Ownership tree: run the OWNED-BY label table. List which Kustomizations are
+   unowned apexes (null owner label). Confirm whether `infrastructure` is owned by
+   the root or is a free-floating apex.
+2. Blast radius: how many children does `infrastructure` own? What is the single
+   most dangerous `kubectl delete` on this cluster?
+3. Self-heal gap: for each unowned apex, state explicitly what would NOT recover
+   automatically if deleted, and what the recovery procedure is (re-apply vs
+   re-bootstrap).
+4. Path analysis: print the root's spec.path and infrastructure's spec.path. Explain
+   whether infrastructure's manifest lives inside the root's rendered tree (and is
+   therefore fixable to be self-healing) or not.
+5. Recommendation: give the concrete, minimal change that would make our office
+   `infrastructure` self-healing like the home lab — i.e. declare it inside the root's
+   path so the root owns and recreates it — WITHOUT having to flatten everything into
+   16 separate root-owned Kustomizations. Note the trade-offs.
+6. Also flag any OTHER unowned apexes besides `infrastructure` (e.g. the apps
+   aggregator) that carry the same delete-and-it-never-comes-back risk.
+
+Output a side-by-side table (office vs home-lab) plus a prioritized remediation list.
+Do not change anything — diagnosis and recommendations only.
+```
+
+---
+
+Want me to also **save the Part 1 summary into the repo docs** (e.g. a `docs/home-lab-vs-office-flux.md`, cross-linked from `learning-agenda.md`) so it's captured alongside the Flux section we said we'd write up?
