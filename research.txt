@@ -1,30 +1,67 @@
-Based on your confirmed architecture, the single object that owns all 32 children is the `infrastructure` Kustomization in `flux-system`. So the command was almost certainly one of these (all three do the same thing):
+Here's a tighter read-only set built specifically to make the **apex-vs-owned** distinction visible. The trick: Flux stamps every object it manages with a label naming its owner — so you can literally ask each Kustomization "who created you?"
 
 ```bash
-kubectl delete kustomization infrastructure -n flux-system
-# or the flux CLI equivalent (defaults to the flux-system namespace):
-flux delete kustomization infrastructure
-# or if he deleted it from a manifest file:
-kubectl delete -f <some-path>/infrastructure.yaml
+# ─────────────────────────────────────────────────────────────
+# A. THE OWNERSHIP TABLE — each Kustomization and WHO OWNS IT
+#    (the label kustomize.toolkit.fluxcd.io/name = the parent that applied it)
+# ─────────────────────────────────────────────────────────────
+kubectl get kustomizations -n flux-system \
+  -o custom-columns='NAME:.metadata.name,OWNED-BY:.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name'
 ```
-
-Any of those → `infrastructure`'s finalizer fires → prunes all 32 children → every addon gone → and since `infrastructure` is an unowned apex, nothing brings it back.
-
-> Note the exact name: the children carry prefixes (`apps.fbg.…`, `apps.fmx-msk.…`), but the apex was just plain `infrastructure`. So the lethal command is literally `delete kustomization infrastructure`. The scary part is how *innocuous* it looks — it reads like deleting "one thing."
-
-## How to confirm *which* command he actually ran
-
-The cluster recorded it — two places to look:
+**What you'll see:** the 32 children show `OWNED-BY: infrastructure`. But `infrastructure` itself and the root `flux-system` show **`<none>`** — that blank is the signature of an **apex object** (nobody applied it via Flux → nobody will recreate it).
 
 ```bash
-# 1. Flux's own controller log — it logs the prune cascade it performed:
-kubectl logs -n flux-system deploy/kustomize-controller | grep -iE 'infrastructure|prune|delet|garbage'
+# ─────────────────────────────────────────────────────────────
+# B. LIST EVERY APEX OBJECT — the Kustomizations with NO owner
+#    (these are the ONLY ones that won't self-heal if deleted)
+# ─────────────────────────────────────────────────────────────
+kubectl get kustomizations -n flux-system -o json \
+  | jq -r '.items[] | select(.metadata.labels["kustomize.toolkit.fluxcd.io/name"] == null) | .metadata.name'
+# no jq? use this instead:
+kubectl get kustomizations -n flux-system \
+  -o custom-columns='NAME:.metadata.name,OWNER:.metadata.labels.kustomize\.toolkit\.fluxcd\.io/name' \
+  | grep '<none>'
+```
+**What you'll see:** `flux-system` and `infrastructure`. Those are your two single-points-of-failure. Everything else self-heals; these two don't.
 
-# 2. Kubernetes audit log (if enabled on the API server / EKS CloudTrail) —
-#    this names the USER, the verb, and the timestamp:
-#    look for: verb=delete  resource=kustomizations  name=infrastructure
+```bash
+# ─────────────────────────────────────────────────────────────
+# C. THE SMOKING GUN — prove the root does NOT own infrastructure
+# ─────────────────────────────────────────────────────────────
+kubectl get kustomization flux-system -n flux-system \
+  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' \
+  | grep -i infrastructure \
+  && echo ">>> root OWNS infrastructure (would self-heal)" \
+  || echo ">>> root does NOT own infrastructure — it is an unowned APEX (will not self-heal)"
 ```
 
-On EKS specifically, that delete shows up in **CloudTrail** as an EKS audit event — `verb: delete`, `objectRef.resource: kustomizations`, `objectRef.name: infrastructure`, plus the IAM identity and exact time. That's your forensic proof of who ran it and when.
+```bash
+# ─────────────────────────────────────────────────────────────
+# D. PROVE infrastructure owns the 32 children — count them
+# ─────────────────────────────────────────────────────────────
+kubectl get kustomization infrastructure -n flux-system \
+  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' \
+  | grep -ci 'Kustomization'
+# → expect ~32. That's the blast radius of one delete.
+```
 
-Want to **reproduce it safely in your lab** so you can watch the exact cascade — but on the *self-healing* version, where you delete a child and it comes back (proving your lab doesn't have the apex flaw the office did)?
+```bash
+# ─────────────────────────────────────────────────────────────
+# E. THE PATHS SIDE BY SIDE — why infrastructure is unowned
+#    (its path is OUTSIDE the folder the root renders)
+# ─────────────────────────────────────────────────────────────
+echo "root renders:           $(kubectl get kustomization flux-system   -n flux-system -o jsonpath='{.spec.path}')"
+echo "infrastructure renders: $(kubectl get kustomization infrastructure -n flux-system -o jsonpath='{.spec.path}')"
+```
+**What you'll see:** the root renders `clusters/fanatics-exchange/dev-1`. If `infrastructure`'s manifest does **not** live inside that folder, the root never applies it → it's the orphan-apex. That single fact is the root cause of "didn't come back."
+
+---
+
+**The story these five tell, in order:**
+- **A** = the whole ownership tree at a glance (who heals whom).
+- **B** = the exact list of objects that *can't* heal — your danger list.
+- **C** = proves `infrastructure` isn't under the root.
+- **D** = proves deleting it takes 32 things down.
+- **E** = explains *why* it's unowned (its manifest lives outside the root's path).
+
+Paste back **A** and **E** especially — those two together show the entire flaw on one screen.
