@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────
+# 1. THE SOURCES — what repos Flux pulls from, and the bootstrap anchor
+# ─────────────────────────────────────────────────────────────
+flux get sources git -A
+kubectl get gitrepositories -A \
+  -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,URL:.spec.url,REF:.spec.ref.branch
+# How Flux was bootstrapped (the root's path = the anchor of the whole tree):
+kubectl get kustomization flux-system -n flux-system \
+  -o jsonpath='{"root path:   "}{.spec.path}{"\nroot source: "}{.spec.sourceRef.kind}/{.spec.sourceRef.name}{"\n"}'
+
+# ─────────────────────────────────────────────────────────────
+# 2. THE KUSTOMIZATIONS — the full tree: name, what folder, which source, deps, prune
+# ─────────────────────────────────────────────────────────────
+kubectl get kustomizations -A \
+  -o custom-columns='NAME:.metadata.name,PATH:.spec.path,SOURCE:.spec.sourceRef.name,DEPENDSON:.spec.dependsOn[*].name,PRUNE:.spec.prune,READY:.status.conditions[?(@.type=="Ready")].status'
+
+# ─────────────────────────────────────────────────────────────
+# 3. THE ADDONS THEMSELVES — every HelmRelease and which namespace it lives in
+# ─────────────────────────────────────────────────────────────
+flux get helmreleases -A
+kubectl get helmreleases -A \
+  -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,CHART:.spec.chart.spec.chart,VERSION:.spec.chart.spec.version'
+
+# ─────────────────────────────────────────────────────────────
+# 4. THE DANGEROUS ROW — find which Kustomization OWNS the addons, then list its inventory
+#    (replace <NAME> with the addons/aggregator Kustomization from step 2 —
+#     the one whose PATH points at clusters/<env> or the components list)
+# ─────────────────────────────────────────────────────────────
+kubectl get kustomization <NAME> -n flux-system \
+  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' | sort
+# ^ if you see all 8 components (kyverno, keda, strimzi, ...) in ONE inventory,
+#   that's the single object whose deletion took everything.
+
+# ─────────────────────────────────────────────────────────────
+# 5. IS THE WIRING SELF-HEALING? — does any Kustomization OWN the others,
+#    or are they apex objects planted by bootstrap?
+# ─────────────────────────────────────────────────────────────
+# For each Kustomization, see if it appears in another's inventory.
+# Quick proxy: does the root (flux-system) inventory contain other Kustomizations?
+kubectl get kustomization flux-system -n flux-system \
+  -o jsonpath='{range .status.inventory.entries[*]}{.id}{"\n"}{end}' | grep -i kustomization
